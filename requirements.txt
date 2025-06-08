@@ -1,0 +1,8 @@
+streamlit
+ultralytics
+opencv-python
+pandas
+Pillow
+fpdf2
+torch
+torchvision
