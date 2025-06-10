@@ -1,4 +1,3 @@
-# requirements.txt
 streamlit
 ultralytics
 pandas
@@ -6,7 +5,5 @@ Pillow
 fpdf2
 streamlit-webrtc
 opencv-python-headless
-
-# Install CPU-only versions of PyTorch, which is required for Streamlit Cloud
 torch --index-url https://download.pytorch.org/whl/cpu
 torchvision --index-url https://download.pytorch.org/whl/cpu
