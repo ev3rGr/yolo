@@ -1,3 +1,6 @@
 freeglut3-dev
 libgtk2.0-dev
 libgl1-mesa-glx
+# packages.txt
+ffmpeg
+libgl1-mesa-glx
