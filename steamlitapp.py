@@ -1,11 +1,16 @@
 import streamlit as st
 from ultralytics import YOLO
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 import pandas as pd
 import io
 import torch
 import collections
 from fpdf import FPDF
+import av
+import threading
+import time
+import cv2
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -67,7 +72,6 @@ def load_css():
 load_css()
 
 # --- Action Suggestions Data ---
-# (Kept the same as your original request)
 ACTION_SUGGESTIONS = {
     "polished_casting": {
         "description": "Excessive polishing can lead to reduced friction and inefficient braking.",
@@ -103,27 +107,26 @@ ACTION_SUGGESTIONS = {
     }
 }
 
-# --- Session State Initialization ---
+# --- Session State & Helper Functions ---
 if 'all_detections' not in st.session_state:
     st.session_state.all_detections = []
 if 'processed_images_data' not in st.session_state:
     st.session_state.processed_images_data = []
 
+lock = threading.Lock()
 
-# --- Helper Functions ---
+
 @st.cache_resource
 def load_yolo_model(model_path):
-    """Loads a YOLO model from the specified path."""
     try:
         model = YOLO(model_path)
         return model
     except Exception as e:
-        st.error(f"Error loading model: {e}")
+        st.error(f"Error loading model from {model_path}: {e}")
         return None
 
 
 def generate_pdf_report():
-    """Generates a PDF report of all detections in the current session."""
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", "B", 16)
@@ -133,65 +136,94 @@ def generate_pdf_report():
     for data in st.session_state.processed_images_data:
         pdf.set_font("Helvetica", "B", 12)
         pdf.cell(0, 10, f"Analysis for: {data['filename']}", 0, 1)
-
-        # Save processed image to a temporary buffer
         img_buffer = io.BytesIO()
         data['processed_image'].save(img_buffer, format="PNG")
         img_buffer.seek(0)
-
-        # Get image dimensions to maintain aspect ratio
         with Image.open(img_buffer) as img:
             width, height = img.size
         aspect_ratio = height / width
-        pdf_img_width = pdf.w - 20  # Full width minus margins
+        pdf_img_width = pdf.w - 20
         pdf_img_height = pdf_img_width * aspect_ratio
-
-        # Reset buffer for FPDF
         img_buffer.seek(0)
-
         pdf.image(img_buffer, x=10, w=pdf_img_width, h=pdf_img_height)
         pdf.ln(5)
-
         if not data['detections']:
             pdf.set_font("Helvetica", "", 10)
             pdf.cell(0, 10, "No defects detected in this image.", 0, 1)
         else:
             pdf.set_font("Helvetica", "B", 10)
-            # Create table header
             pdf.cell(60, 10, "Defect Class", 1)
             pdf.cell(40, 10, "Confidence", 1)
             pdf.ln()
-            # Create table rows
             pdf.set_font("Helvetica", "", 10)
             for det in data['detections']:
                 pdf.cell(60, 10, det['class'], 1)
                 pdf.cell(40, 10, f"{det['confidence']:.2%}", 1)
                 pdf.ln()
-
-        # Check if we need to add a new page to avoid overflow
         if pdf.get_y() > 250:
             pdf.add_page()
-
-    # The final, corrected return statement:
     return bytes(pdf.output())
 
 
-# --- Sidebar ---
+# --- Real-Time Video Processor with FPS ---
+class YOLOVideoTransformer(VideoTransformerBase):
+    def __init__(self):
+        self.model = None
+        self.conf = 0.25
+        self.iou = 0.45
+        self.device = 'cpu'
+        self.last_time = time.time()
+        self.fps = 0
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+
+        current_time = time.time()
+        time_diff = current_time - self.last_time
+        if time_diff > 0:
+            self.fps = 1 / time_diff
+        self.last_time = current_time
+
+        if self.model is None:
+            fps_text = f"FPS: {self.fps:.2f} (Model not loaded)"
+            cv2.putText(img, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+        results = self.model.predict(
+            source=img, conf=self.conf, iou=self.iou, device=self.device, verbose=False
+        )
+        annotated_frame = results[0].plot()
+
+        fps_text = f"FPS: {self.fps:.2f} ({self.device.upper()})"
+        cv2.putText(annotated_frame, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+
+        return av.VideoFrame.from_ndarray(annotated_frame, format="bgr24")
+
+
+# --- Sidebar Configuration ---
 with st.sidebar:
     st.title("🛰️ AuraVision Inspector")
+    model = load_yolo_model("models/best.pt")
 
-    # Model Selection
-    model_path = "models/best.pt"  # Default model
-    model = load_yolo_model(model_path)
-
-    # Input Settings
     st.header("⚙️ Analysis Settings")
     confidence_threshold = st.slider("Confidence Threshold", 0.0, 1.0, 0.25, 0.05)
     iou_threshold = st.slider("IoU Threshold", 0.0, 1.0, 0.45, 0.05)
 
-    # Device Selection
-    device_options = ["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]
-    device = st.radio("Compute Device", device_options, horizontal=True)
+    if torch.cuda.is_available():
+        st.success("✅ GPU (CUDA) available!")
+        device_options = ["cuda", "cpu"]
+    else:
+        st.warning("⚠️ No GPU detected or PyTorch is CPU-only.")
+        st.info("For GPU acceleration, ensure NVIDIA drivers and the correct PyTorch version are installed.")
+        device_options = ["cpu"]
+    device = st.radio("Compute Device", device_options, horizontal=True, index=0)
+
+    if model:
+        try:
+            model.to(device)
+            st.write(f"Model loaded on: **{device.upper()}**")
+        except Exception as e:
+            st.error(f"Failed to move model to device '{device}': {e}")
 
     st.header("📥 Input Source")
     input_source = st.radio("Select source:", ["Image Upload", "Live Camera"], horizontal=True)
@@ -206,20 +238,18 @@ with st.sidebar:
 st.title("AI Defect Detection Dashboard")
 st.markdown("Upload images or use a live camera feed to identify manufacturing defects with AI.")
 
-# --- Input Handling ---
 if model:
     if input_source == "Image Upload":
         uploaded_files = st.file_uploader(
-            "Upload image files",
-            type=["jpg", "jpeg", "png"],
-            accept_multiple_files=True,
-            label_visibility="collapsed"
+            "Upload image files", type=["jpg", "jpeg", "png"], accept_multiple_files=True, label_visibility="collapsed"
         )
         if uploaded_files:
+            st.session_state.processed_images_data = [d for d in st.session_state.processed_images_data if
+                                                      "Live Frame" not in d["filename"]]
+
             for uploaded_file in uploaded_files:
                 image = Image.open(uploaded_file)
                 results = model(image, conf=confidence_threshold, iou=iou_threshold, device=device)
-
                 detections = []
                 for r in results:
                     for box in r.boxes:
@@ -227,49 +257,43 @@ if model:
                         class_name = model.names[class_id]
                         confidence = float(box.conf)
                         detections.append({"class": class_name, "confidence": confidence})
-                        st.session_state.all_detections.append({"class": class_name, "confidence": confidence})
-
+                with lock:
+                    st.session_state.all_detections.extend(detections)
                 res_plotted = results[0].plot()
                 processed_image_rgb = Image.fromarray(res_plotted[..., ::-1])
                 st.session_state.processed_images_data.append({
-                    "filename": uploaded_file.name,
-                    "original_image": image,
-                    "processed_image": processed_image_rgb,
+                    "filename": uploaded_file.name, "original_image": image, "processed_image": processed_image_rgb,
                     "detections": detections
                 })
 
     elif input_source == "Live Camera":
-        st.info("Position the object in front of the camera and click 'Analyze Frame'.")
-        camera_image_file = st.camera_input("Live Camera Feed", label_visibility="collapsed")
-        if camera_image_file:
-            image = Image.open(camera_image_file)
-            results = model(image, conf=confidence_threshold, iou=iou_threshold, device=device)
+        st.info("Your browser will ask for camera permission. The feed below is processed in real-time.")
 
-            detections = []
-            for r in results:
-                for box in r.boxes:
-                    class_id = int(box.cls)
-                    class_name = model.names[class_id]
-                    confidence = float(box.conf)
-                    detections.append({"class": class_name, "confidence": confidence})
-                    st.session_state.all_detections.append({"class": class_name, "confidence": confidence})
+        media_stream_constraints = {"video": {"width": {"ideal": 1280}, "height": {"ideal": 720}}, "audio": False}
 
-            res_plotted = results[0].plot()
-            processed_image_rgb = Image.fromarray(res_plotted[..., ::-1])
+        webrtc_ctx = webrtc_streamer(
+            key="yolo-detection",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+            video_processor_factory=YOLOVideoTransformer,
+            media_stream_constraints=media_stream_constraints,
+            async_processing=True,
+        )
 
-            # For camera, we overwrite the last analysis to avoid flooding the session
-            st.session_state.processed_images_data = [{
-                "filename": "Live Camera Frame",
-                "original_image": image,
-                "processed_image": processed_image_rgb,
-                "detections": detections
-            }]
+        if webrtc_ctx.state.playing and webrtc_ctx.video_processor:
+            video_transformer = webrtc_ctx.video_processor
+            video_transformer.model = model
+            video_transformer.conf = confidence_threshold
+            video_transformer.iou = iou_threshold
+            video_transformer.device = device
 
 # --- Dashboard Display ---
-if not st.session_state.processed_images_data:
+if not st.session_state.processed_images_data and not (
+        input_source == "Live Camera" and st.session_state.get('webrtc_ctx', {}).get('state', {}).get('playing',
+                                                                                                      False)):
     st.image("https://i.imgur.com/gY91G6W.png", caption="Awaiting analysis...", use_container_width=True)
-else:
-    # --- Summary Metrics & Charts ---
+
+if st.session_state.processed_images_data:
     st.header("📊 Session Dashboard")
     total_images = len(st.session_state.processed_images_data)
     total_defects = len(st.session_state.all_detections)
@@ -278,7 +302,6 @@ else:
     col1.metric("Images Analyzed", total_images)
     col2.metric("Total Defects Found", total_defects)
     col3.metric("Avg. Defects / Image", f"{total_defects / total_images:.2f}" if total_images > 0 else "0.00")
-
     st.divider()
 
     col_chart, col_download = st.columns([2, 1])
@@ -290,32 +313,27 @@ else:
             st.bar_chart(df_counts)
         else:
             st.info("No defects detected yet in this session.")
-
     with col_download:
         st.subheader("Export Results")
         if total_defects > 0:
-            # CSV Download
             df_export = pd.DataFrame(st.session_state.all_detections)
             csv_data = df_export.to_csv(index=False).encode('utf-8')
             st.download_button("Download CSV", csv_data, "defect_report.csv", "text/csv", use_container_width=True)
-
-            # PDF Download
             pdf_data = generate_pdf_report()
             st.download_button("Download PDF Report", pdf_data, "defect_report.pdf", "application/pdf",
                                use_container_width=True)
-
+        else:
+            st.info("No data to export.")
     st.divider()
 
-    # --- Detailed Breakdown per Image ---
     st.header("🖼️ Detailed Analysis")
-    for data in reversed(st.session_state.processed_images_data):  # Show most recent first
+    for data in reversed(st.session_state.processed_images_data):
         with st.expander(f"**{data['filename']}** | Found {len(data['detections'])} defects"):
             col_img1, col_img2 = st.columns(2)
             with col_img1:
                 st.image(data['original_image'], caption="Original Image", use_container_width=True)
             with col_img2:
                 st.image(data['processed_image'], caption="Processed Image", use_container_width=True)
-
             if not data['detections']:
                 st.success("✅ No defects found in this image.")
             else:
@@ -323,7 +341,6 @@ else:
                 for i, det in enumerate(data['detections']):
                     st.markdown(f"--- \n#### Defect #{i + 1}: `{det['class']}`")
                     st.progress(det['confidence'], text=f"Confidence: {det['confidence']:.2f}")
-
                     suggestion = ACTION_SUGGESTIONS.get(det['class'])
                     if suggestion:
                         with st.container(border=True):
